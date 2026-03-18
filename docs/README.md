@@ -1,139 +1,415 @@
-<!---
-Copyright 2020 The HuggingFace Team. All rights reserved.
+# SmolVLA 500M × LIBERO: Hướng Dẫn Đầy Đủ
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
--->
-
-# Generating the documentation
-
-To generate the documentation, you first have to build it. Several packages are necessary to build the doc,
-you can install them with the following command, at the root of the code repository:
-
-```bash
-pip install -e . -r docs-requirements.txt
-```
-
-You will also need `nodejs`. Please refer to their [installation page](https://nodejs.org/en/download)
+Hướng dẫn end-to-end: từ chuẩn bị dataset, cấu hình normalization, training SmolVLA 500M trên LIBERO, đến evaluation.
 
 ---
 
-**NOTE**
+## Mục Lục
 
-You only need to generate the documentation to inspect it locally (if you're planning changes and want to
-check how they look before committing for instance). You don't have to `git commit` the built documentation.
-
----
-
-## Building the documentation
-
-Once you have setup the `doc-builder` and additional packages, you can generate the documentation by
-typing the following command:
-
-```bash
-doc-builder build lerobot docs/source/ --build_dir ~/tmp/test-build
-```
-
-You can adapt the `--build_dir` to set any temporary folder that you prefer. This command will create it and generate
-the MDX files that will be rendered as the documentation on the main website. You can inspect them in your favorite
-Markdown editor.
-
-## Previewing the documentation
-
-To preview the docs, first install the `watchdog` module with:
-
-```bash
-pip install watchdog
-```
-
-Then run the following command:
-
-```bash
-doc-builder preview lerobot docs/source/
-```
-
-The docs will be viewable at [http://localhost:3000](http://localhost:3000). You can also preview the docs once you have opened a PR. You will see a bot add a comment to a link where the documentation with your changes lives.
+1. [Tổng Quan Kiến Trúc](#1-tổng-quan-kiến-trúc)
+2. [Cài Đặt](#2-cài-đặt)
+3. [Chuẩn Bị Dataset](#3-chuẩn-bị-dataset)
+4. [Normalization — Hướng Tốt Nhất](#4-normalization--hướng-tốt-nhất)
+5. [Training](#5-training)
+6. [Evaluation](#6-evaluation)
+7. [Tham Khảo Nhanh](#7-tham-khảo-nhanh)
 
 ---
 
-**NOTE**
+## 1. Tổng Quan Kiến Trúc
 
-The `preview` command only works with existing doc files. When you add a completely new file, you need to update `_toctree.yml` & restart `preview` command (`ctrl-c` to stop it & call `doc-builder preview ...` again).
+SmolVLA là model VLA (Vision-Language-Action) sử dụng **Flow Matching** để sinh action chunk.
+
+```
+┌──────────────────────────────────┐
+│              actions (7-D)       │
+│                  ▲               │
+│  ┌──────────┐   ┌──┴─────┐      │
+│  │          │──►│        │      │
+│  │          │kv │ Action │      │
+│  │SmolVLM2  │──►│ Expert │      │
+│  │  500M    │   │(cross- │      │
+│  │(SigLIP+  │──►│ attn)  │      │
+│  │  LLM)    │   │        │      │
+│  └▲──▲──▲───┘   └───▲────┘      │
+│   │  │  │           │           │
+│   │  │ state     noise          │
+│   │ language      (10 steps)    │
+│  images                         │
+└──────────────────────────────────┘
+```
+
+**Thông số chính:**
+
+| Tham số | Giá trị |
+|---------|---------|
+| VLM backbone | `SmolVLM2-500M-Video-Instruct` |
+| Vision encoder | SigLIP (frozen) |
+| Action chunk size | 50 |
+| Denoising steps | 10 |
+| Image resize | 512×512 (pad giữ aspect ratio) |
+| Image normalize | `[0,1] → [-1,1]` (SigLIP range) |
+| Max state dim | 32 (auto-pad) |
+| Max action dim | 32 (auto-pad) |
+| Trainable | Action Expert only (`train_expert_only=True`) |
+| Expert width | 0.75× VLM hidden size |
 
 ---
 
-## Adding a new element to the navigation bar
+## 2. Cài Đặt
 
-Accepted files are Markdown (.md).
+```bash
+# Clone project
+git clone <repo-url> && cd pact
 
-Create a file with its extension and put it in the source directory. You can then link it to the toc-tree by putting
-the filename without the extension in the [`_toctree.yml`](https://github.com/huggingface/lerobot/blob/main/docs/source/_toctree.yml) file.
+# Install LeRobot + SmolVLA dependencies
+pip install -e ".[smolvla]"
 
-## Renaming section headers and moving sections
-
-It helps to keep the old links working when renaming the section header and/or moving sections from one document to another. This is because the old links are likely to be used in Issues, Forums, and Social media and it'd make for a much more superior user experience if users reading those months later could still easily navigate to the originally intended information.
-
-Therefore, we simply keep a little map of moved sections at the end of the document where the original section was. The key is to preserve the original anchor.
-
-So if you renamed a section from: "Section A" to "Section B", then you can add at the end of the file:
-
-```
-Sections that were moved:
-
-[ <a href="#section-b">Section A</a><a id="section-a"></a> ]
+# Install LIBERO (nếu cần eval sim)
+pip install libero
 ```
 
-and of course, if you moved it to another file, then:
+**Yêu cầu GPU**: ≥ 16GB VRAM (RTX 3090, A100, ...)
+
+---
+
+## 3. Chuẩn Bị Dataset
+
+### 3.1 Cấu Trúc HDF5 Hiện Tại
+
+Dataset LIBERO nằm tại `dataset/LIBERO/`:
+```
+dataset/LIBERO/
+├── libero_spatial/
+│   ├── pick_up_the_black_bowl_*.hdf5
+│   └── ...
+├── libero_object/
+├── libero_goal/
+├── libero_10/
+└── libero_90/
+```
+
+Mỗi file HDF5:
+```
+data/
+├── demo_0/
+│   ├── obs/
+│   │   ├── agentview_rgb       (T, 256, 256, 3) uint8
+│   │   ├── eye_in_hand_rgb     (T, 256, 256, 3) uint8
+│   │   ├── robot0_joint_pos    (T, 7)           float32  [rad]
+│   │   └── robot0_gripper_qpos (T, 2)           float32  [cm]
+│   ├── actions                 (T, 7)           float32
+│   └── dones                   (T,)             bool
+├── demo_1/ ...
+└── demo_N/
+```
+
+### 3.2 Convert HDF5 → LeRobot Dataset Format
+
+LeRobot sử dụng format riêng (Parquet + MP4). Cần convert:
+
+```python
+# scripts/convert_libero_to_lerobot.py
+"""Convert LIBERO HDF5 → LeRobot dataset format."""
+import h5py
+import numpy as np
+from pathlib import Path
+from lerobot.datasets.lerobot_dataset import LeRobotDataset
+
+# Xem doc chi tiết: https://huggingface.co/docs/lerobot/lerobot-dataset-v3
+
+# Cách 1: Sử dụng lerobot built-in converter nếu dataset đã trên Hub
+# Cách 2: Push HDF5 data lên Hub rồi dùng LeRobot API
+# Cách 3: Tự convert bằng script (xem bên dưới)
+```
+
+**Features mapping khi convert:**
+
+| HDF5 key | LeRobot key | Shape | Type |
+|----------|-------------|-------|------|
+| `obs/agentview_rgb` | `observation.images.image` | (256,256,3) | VISUAL |
+| `obs/eye_in_hand_rgb` | `observation.images.image2` | (256,256,3) | VISUAL |
+| `obs/robot0_joint_pos` | `observation.state` (dims 0-6) | (7,) | STATE |
+| `obs/robot0_gripper_qpos` | `observation.state` (dims 7-8) | (2,) | STATE |
+| `actions` | `action` | (7,) | ACTION |
+
+> **Quan trọng:** State = concat(`joint_pos[7]`, `gripper_qpos[2]`) = **9-D vector**.
+
+### 3.3 Verify Dataset
+
+```bash
+# Kiểm tra dataset sau khi convert
+python -c "
+from lerobot.datasets.lerobot_dataset import LeRobotDataset
+ds = LeRobotDataset('<YOUR_HF_USER>/libero_spatial')
+print(f'Episodes: {ds.num_episodes}')
+print(f'Frames: {ds.num_frames}')
+print(f'Features: {list(ds.meta.features.keys())}')
+print(f'Stats keys: {list(ds.meta.stats.keys())}')
+"
+```
+
+---
+
+## 4. Normalization — Hướng Tốt Nhất
+
+### 4.1 So Sánh Các Phương Án
+
+| Thành phần | SmolVLA mặc định | Cấu hình tùy chỉnh (docs/libero.md) | ✅ Khuyến nghị |
+|------------|:----------------:|:------------------------------------:|:--------------:|
+| **Action (Δpose, dims 0-5)** | MEAN_STD | Z-score | **MEAN_STD** ✅ |
+| **Action (gripper, dim 6)** | MEAN_STD | Passthrough {-1,+1} | **MEAN_STD** ✅ |
+| **State (joints, dims 0-6)** | MEAN_STD | Z-score | **MEAN_STD** ✅ |
+| **State (fingers, dims 7-8)** | MEAN_STD | Min-Max [-1,1] | **MEAN_STD** ✅ |
+| **Images** | IDENTITY* | CLIP mean/std | **IDENTITY** ✅ |
+
+> \* SmolVLA tự xử lý images bên trong `prepare_images()`: resize → 512×512 → normalize `[0,1]→[-1,1]` cho SigLIP.
+
+### 4.2 Tại Sao Dùng MEAN_STD Mặc Định?
+
+**① Gripper binary {-1, +1} vẫn ổn với MEAN_STD:**
+- LeRobot tính mean/std **per-dimension**
+- Gripper dim 6: mean ≈ 0 (nếu open/close cân bằng), std ≈ 1
+- Normalized ≈ {-1, +1} — không bị phóng đại
+
+**② Finger offsets vẫn ổn với MEAN_STD:**
+- Dù dải giá trị nhỏ (0.01–0.04 cm), LeRobot tính std per-dim
+- Normalized sẽ center quanh 0 với std ≈ 1
+
+**③ Image IDENTITY — SmolVLA tự xử lý:**
+- SmolVLA dùng SigLIP (không phải CLIP)
+- Cấu hình CLIP mean/std trong `docs/libero.md` dành cho model khác (ACT, Diffusion)
+- **KHÔNG áp dụng CLIP normalize cho SmolVLA**
+
+### 4.3 Cấu Hình Normalization (tự động)
+
+SmolVLA đã cài sẵn trong `configuration_smolvla.py`:
+```python
+normalization_mapping = {
+    "VISUAL": NormalizationMode.IDENTITY,   # ảnh: tự xử lý bên trong
+    "STATE":  NormalizationMode.MEAN_STD,   # Z-score per-dim
+    "ACTION": NormalizationMode.MEAN_STD,   # Z-score per-dim
+}
+```
+
+**Không cần thay đổi gì** — chỉ cần đảm bảo dataset có statistics đúng.
+
+---
+
+## 5. Training
+
+### 5.1 Train Từ Scratch
+
+```bash
+lerobot-train \
+  --policy.type=smolvla \
+  --dataset.repo_id=<YOUR_HF_USER>/libero_spatial \
+  --batch_size=64 \
+  --steps=200000 \
+  --output_dir=outputs/train/smolvla_libero_spatial \
+  --policy.device=cuda \
+  --save_freq=10000 \
+  --log_freq=100 \
+  --seed=42
+```
+
+### 5.2 Finetune Từ Pretrained
+
+```bash
+lerobot-train \
+  --policy.path=lerobot/smolvla_base \
+  --dataset.repo_id=<YOUR_HF_USER>/libero_spatial \
+  --batch_size=64 \
+  --steps=100000 \
+  --output_dir=outputs/train/smolvla_libero_finetuned \
+  --policy.device=cuda \
+  --save_freq=10000 \
+  --log_freq=100 \
+  --wandb.enable=true \
+  --job_name=smolvla_libero_finetune
+```
+
+### 5.3 Train Multi-Suite (tất cả LIBERO)
+
+```bash
+# Train trên nhiều suite cùng lúc
+lerobot-train \
+  --policy.type=smolvla \
+  --dataset.repo_id=<YOUR_HF_USER>/libero_all \
+  --batch_size=64 \
+  --steps=300000 \
+  --output_dir=outputs/train/smolvla_libero_all \
+  --policy.device=cuda
+```
+
+### 5.4 Hyperparameters
+
+| Tham số | Giá trị mặc định | Ghi chú |
+|---------|:-----------------:|---------|
+| Optimizer | AdamW | |
+| Learning rate | 1e-4 | |
+| Betas | (0.9, 0.95) | |
+| Weight decay | 1e-10 | |
+| Grad clip norm | 10 | |
+| Warmup steps | 1,000 | |
+| Decay steps | 30,000 | |
+| Final LR | 2.5e-6 | |
+| Scheduler | Cosine + Warmup | |
+| Batch size | 64 | Giảm nếu OOM |
+
+**Override hyperparams:**
+```bash
+lerobot-train \
+  --policy.type=smolvla \
+  --dataset.repo_id=<DATASET> \
+  --policy.optimizer_lr=5e-5 \
+  --policy.scheduler_warmup_steps=2000 \
+  --policy.scheduler_decay_steps=50000 \
+  --batch_size=32 \
+  --steps=200000
+```
+
+### 5.5 Luồng Dữ Liệu Khi Training
 
 ```
-Sections that were moved:
-
-[ <a href="../new-file#section-b">Section A</a><a id="section-a"></a> ]
+HDF5/Parquet Data
+      │
+      ▼
+┌─ Preprocessor Pipeline ────────────────────────┐
+│ 1. RenameObservationsProcessorStep             │
+│ 2. AddBatchDimensionProcessorStep              │
+│ 3. SmolVLANewLineProcessor (thêm \n vào task)  │
+│ 4. TokenizerProcessorStep (max_len=48)         │
+│ 5. DeviceProcessorStep (→ GPU)                 │
+│ 6. NormalizerProcessorStep (MEAN_STD)          │
+└────────────────────────────────────────────────┘
+      │
+      ▼
+┌─ Model Forward ────────────────────────────────┐
+│ • prepare_images(): resize→512×512, [0,1]→[-1,1]│
+│ • prepare_state(): pad 9-D → 32-D              │
+│ • prepare_action(): pad 7-D → 32-D             │
+│                                                 │
+│ Flow Matching Loss:                             │
+│   x_t = t·noise + (1-t)·action                 │
+│   u_t = noise - action                          │
+│   loss = MSE(u_t, v_t)                          │
+└─────────────────────────────────────────────────┘
 ```
 
-Use the relative style to link to the new file so that the versioned docs continue to work.
+---
 
-For an example of a rich moved sections set please see the very end of [the transformers Trainer doc](https://github.com/huggingface/transformers/blob/main/docs/source/en/main_classes/trainer.md).
+## 6. Evaluation
 
-### Adding a new tutorial
+### 6.1 Eval trên LIBERO Simulation
 
-Adding a new tutorial or section is done in two steps:
-
-- Add a new file under `./source`. This file can either be ReStructuredText (.rst) or Markdown (.md).
-- Link that file in `./source/_toctree.yml` on the correct toc-tree.
-
-Make sure to put your new file under the proper section. If you have a doubt, feel free to ask in a Github Issue or PR.
-
-### Writing source documentation
-
-Values that should be put in `code` should either be surrounded by backticks: \`like so\`. Note that argument names
-and objects like True, None or any strings should usually be put in `code`.
-
-#### Writing a multi-line code block
-
-Multi-line code blocks can be useful for displaying examples. They are done between two lines of three backticks as usual in Markdown:
-
-````
+```bash
+lerobot-eval \
+  --policy.path=outputs/train/smolvla_libero_spatial/checkpoints/200000/pretrained_model \
+  --env.type=libero \
+  --env.task=libero_spatial \
+  --eval.batch_size=10 \
+  --eval.n_episodes=20 \
+  --policy.device=cuda \
+  --seed=42
 ```
-# first line of code
-# second line
-# etc
+
+### 6.2 Eval Multi-Suite
+
+```bash
+# Eval trên từng suite riêng
+for SUITE in libero_spatial libero_object libero_goal libero_10; do
+  lerobot-eval \
+    --policy.path=outputs/train/smolvla_libero_all/checkpoints/BEST/pretrained_model \
+    --env.type=libero \
+    --env.task=$SUITE \
+    --eval.batch_size=10 \
+    --eval.n_episodes=20 \
+    --policy.device=cuda \
+    --output_dir=outputs/eval/smolvla_${SUITE}
+done
 ```
-````
 
-#### Adding an image
+### 6.3 Eval Với Video Recording
 
-Due to the rapidly growing repository, it is important to make sure that no files that would significantly weigh down the repository are added. This includes images, videos, and other non-text files. We prefer to leverage a hf.co hosted `dataset` like
-the ones hosted on [`hf-internal-testing`](https://huggingface.co/hf-internal-testing) in which to place these files and reference
-them by URL. We recommend putting them in the following dataset: [huggingface/documentation-images](https://huggingface.co/datasets/huggingface/documentation-images).
-If an external contribution, feel free to add the images to your PR and ask a Hugging Face member to migrate your images
-to this dataset.
+```bash
+lerobot-eval \
+  --policy.path=<CHECKPOINT_PATH> \
+  --env.type=libero \
+  --env.task=libero_spatial \
+  --eval.batch_size=5 \
+  --eval.n_episodes=10 \
+  --policy.device=cuda
+# Video tự động lưu tại output_dir/videos/
+```
+
+### 6.4 LIBERO Environment Config
+
+| Suite | Tasks | Max Steps/Episode |
+|-------|:-----:|:-----------------:|
+| `libero_spatial` | 10 | 280 |
+| `libero_object` | 10 | 280 |
+| `libero_goal` | 10 | 300 |
+| `libero_10` | 10 | 520 |
+| `libero_90` | 90 | 400 |
+
+**Camera Mapping (eval env → policy):**
+```
+agentview_image         → observation.images.image
+robot0_eye_in_hand_image → observation.images.image2
+```
+
+**Action Space:** 7-D delta EEF pose (relative mode), gripper dim 6 = {-1=open, +1=close}
+
+---
+
+## 7. Tham Khảo Nhanh
+
+### Cấu Trúc File Quan Trọng
+
+```
+src/lerobot/
+├── policies/smolvla/
+│   ├── configuration_smolvla.py   # Config: normalization, hyperparams
+│   ├── modeling_smolvla.py        # Model: VLA + Flow Matching
+│   └── processor_smolvla.py       # Pre/post processing pipeline
+├── envs/
+│   ├── libero.py                  # LIBERO environment wrapper
+│   ├── configs.py                 # LiberoEnv config (features, cameras)
+│   └── factory.py                 # Env creation factory
+├── processor/
+│   └── normalize_processor.py     # MEAN_STD, MIN_MAX, QUANTILES logic
+└── scripts/
+    ├── lerobot_train.py           # Training entrypoint
+    └── lerobot_eval.py            # Evaluation entrypoint
+```
+
+### Lệnh Thường Dùng
+
+```bash
+# Xem help
+lerobot-train --help
+lerobot-eval --help
+
+# Train SmolVLA
+lerobot-train --policy.type=smolvla --dataset.repo_id=<DATASET> --steps=200000
+
+# Finetune từ pretrained
+lerobot-train --policy.path=lerobot/smolvla_base --dataset.repo_id=<DATASET>
+
+# Eval
+lerobot-eval --policy.path=<CHECKPOINT> --env.type=libero --env.task=libero_spatial
+
+# Xem dataset info
+python -c "from lerobot.datasets.lerobot_dataset import LeRobotDataset; ds = LeRobotDataset('<DATASET>'); print(ds)"
+```
+
+### Troubleshooting
+
+| Vấn đề | Giải pháp |
+|--------|-----------|
+| OOM khi train | Giảm `--batch_size` (32 → 16 → 8) |
+| EGL error khi eval | `export MUJOCO_GL=egl` hoặc `export MUJOCO_GL=osmesa` |
+| LIBERO not found | `pip install libero` và set `LIBERO_ROOT` env var |
+| Images sai size | SmolVLA tự resize → 512×512, không cần lo |
+| Gripper luôn sai | Kiểm tra dataset stats, đảm bảo gripper dim có mean≈0, std≈1 |
