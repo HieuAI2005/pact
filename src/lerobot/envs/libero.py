@@ -400,12 +400,20 @@ def create_libero_envs(
     env_cls: Callable[[Sequence[Callable[[], Any]]], Any] | None = None,
     control_mode: str = "relative",
     episode_length: int | None = None,
+    lazy: bool = False,
 ) -> dict[str, dict[int, Any]]:
     """
     Create vectorized LIBERO environments with a consistent return shape.
 
     Returns:
-        dict[suite_name][task_id] -> vec_env (env_cls([...]) with exactly n_envs factories)
+        dict[suite_name][task_id] -> vec_env  (lazy=False, default)
+        dict[suite_name][task_id] -> Callable[[], vec_env]  (lazy=True)
+
+    When lazy=True, no MuJoCo instances are created upfront. Each value in the
+    returned dict is a zero-argument factory that creates (and should be closed
+    after use) a single vec_env. This avoids loading all tasks into RAM at once,
+    which is critical for large suites like libero_90 on memory-constrained machines.
+
     Notes:
         - n_envs is the number of rollouts *per task* (episode_index = 0..n_envs-1).
         - `task` can be a single suite or a comma-separated list of suites.
@@ -425,7 +433,8 @@ def create_libero_envs(
         raise ValueError("`task` must contain at least one LIBERO suite name.")
 
     print(
-        f"Creating LIBERO envs | suites={suite_names} | n_envs(per task)={n_envs} | init_states={init_states}"
+        f"Creating LIBERO envs | suites={suite_names} | n_envs(per task)={n_envs} "
+        f"| init_states={init_states} | lazy={lazy}"
     )
     if task_ids_filter is not None:
         print(f"Restricting to task_ids={task_ids_filter}")
@@ -450,8 +459,13 @@ def create_libero_envs(
                 gym_kwargs=gym_kwargs,
                 control_mode=control_mode,
             )
-            out[suite_name][tid] = env_cls(fns)
-            print(f"Built vec env | suite={suite_name} | task_id={tid} | n_envs={n_envs}")
+            if lazy:
+                # Store a factory; the caller is responsible for calling it and closing the result
+                out[suite_name][tid] = partial(env_cls, fns)
+                print(f"Registered lazy env factory | suite={suite_name} | task_id={tid} | n_envs={n_envs}")
+            else:
+                out[suite_name][tid] = env_cls(fns)
+                print(f"Built vec env | suite={suite_name} | task_id={tid} | n_envs={n_envs}")
 
     # return plain dicts for predictability
     return {suite: dict(task_map) for suite, task_map in out.items()}

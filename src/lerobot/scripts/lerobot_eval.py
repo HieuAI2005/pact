@@ -752,19 +752,29 @@ def eval_policy_all(
     if max_parallel_tasks <= 1:
         # sequential path (single accumulator path on the main thread)
         # NOTE: keeping a single-threaded accumulator avoids concurrent list appends or locks
-        for task_group, task_id, env in tasks:
+        for task_group, task_id, env_or_factory in tasks:
+            is_lazy = callable(env_or_factory) and not hasattr(env_or_factory, "reset")
+            env = env_or_factory() if is_lazy else env_or_factory
             tg, tid, metrics = task_runner(task_group, task_id, env)
+            if is_lazy:
+                env.close()
             _accumulate_to(tg, metrics)
             per_task_infos.append({"task_group": tg, "task_id": tid, "metrics": metrics})
     else:
         # threaded path: submit all tasks, consume completions on main thread and accumulate there
+        # Note: lazy envs are NOT supported with max_parallel_tasks > 1 to avoid concurrent MuJoCo init
         with cf.ThreadPoolExecutor(max_workers=max_parallel_tasks) as executor:
             fut2meta = {}
-            for task_group, task_id, env in tasks:
+            for task_group, task_id, env_or_factory in tasks:
+                is_lazy = callable(env_or_factory) and not hasattr(env_or_factory, "reset")
+                env = env_or_factory() if is_lazy else env_or_factory
                 fut = executor.submit(task_runner, task_group, task_id, env)
-                fut2meta[fut] = (task_group, task_id)
+                fut2meta[fut] = (task_group, task_id, env if is_lazy else None)
             for fut in cf.as_completed(fut2meta):
+                tg, tid, lazy_env = fut2meta[fut]
                 tg, tid, metrics = fut.result()
+                if lazy_env is not None:
+                    lazy_env.close()
                 _accumulate_to(tg, metrics)
                 per_task_infos.append({"task_group": tg, "task_id": tid, "metrics": metrics})
 

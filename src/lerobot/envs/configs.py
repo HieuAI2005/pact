@@ -291,6 +291,7 @@ class LiberoEnv(EnvConfig):
         }
     )
     control_mode: str = "relative"  # or "absolute"
+    lazy_envs: bool = False  # If True, env instances are created/destroyed one at a time during eval (saves RAM for large suites like libero_90)
 
     def __post_init__(self):
         if self.obs_type == "pixels":
