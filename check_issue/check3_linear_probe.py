@@ -40,6 +40,7 @@ from libero.libero.envs import OffScreenRenderEnv
 import os
 
 from lerobot.envs.libero import get_task_init_states, TASK_SUITE_MAX_STEPS
+from common_smolvla import load_smolvla_runtime, parse_rename_map
 
 
 # ── backbone feature extraction ───────────────────────────────────────────────
@@ -51,17 +52,16 @@ class SmolVLAFeatureExtractor:
     feature vector before the action expert sees it.
     """
 
-    def __init__(self, policy, processor, device):
-        self.policy = policy
-        self.processor = processor
-        self.device = device
+    def __init__(self, runtime):
+        self.runtime = runtime
+        self.policy = runtime.policy
         self._features = None
         self._hook = None
         self._register_hook()
 
     def _register_hook(self):
         """Hook into the last layer of the VLM text model."""
-        vlm_model = self.policy.model.model.vlm.model
+        vlm_model = self.policy.model.vlm_with_expert.get_vlm_model()
         last_layer = vlm_model.text_model.layers[-1]
 
         def hook_fn(module, input, output):
@@ -81,24 +81,9 @@ class SmolVLAFeatureExtractor:
         """
         Forward pass through backbone. Returns mean-pooled hidden state (D,).
         """
-        from PIL import Image
-
-        agentview = obs.get("agentview_image")
-        wrist = obs.get("robot0_eye_in_hand_image")
-        images = []
-        if agentview is not None:
-            images.append(Image.fromarray(agentview))
-        if wrist is not None:
-            images.append(Image.fromarray(wrist))
-
-        processed = self.processor(text=[lang], images=images, return_tensors="pt")
-        batch = {k: v.to(self.device) for k, v in processed.items()}
-
-        eef_pos = obs.get("robot0_eef_pos", np.zeros(3))
-        eef_quat = obs.get("robot0_eef_quat", np.zeros(4))
-        gripper = obs.get("robot0_gripper_qpos", np.zeros(2))
-        state = np.concatenate([eef_pos, eef_quat, gripper])
-        batch["observation.state"] = torch.tensor(state, dtype=torch.float32).unsqueeze(0).to(self.device)
+        batch = self.runtime.prepare_batch(obs, lang)
+        if batch is None:
+            return None
 
         self._features = None
         with torch.no_grad():
@@ -147,7 +132,7 @@ def eval_predicate_safe(env, predicate) -> int:
 # ── data collection ───────────────────────────────────────────────────────────
 
 def collect_features_and_labels(suite, task_id, init_state_id, max_steps,
-                                 extractor, policy_fn_raw):
+                                 extractor, policy_fn_raw, reset_fn=None):
     """
     Run one episode. At each step extract backbone features and predicate labels.
     Returns:
@@ -164,6 +149,9 @@ def collect_features_and_labels(suite, task_id, init_state_id, max_steps,
     features = []
     labels = []
     obs = env._get_observations()
+
+    if reset_fn is not None:
+        reset_fn()
 
     for step in range(max_steps):
         # Extract features
@@ -244,37 +232,26 @@ def main():
                         help="Episodes per task (split 70/30 for train/test)")
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--out", type=str, default="check_issue/results/check3.json")
+    parser.add_argument("--rename_map", type=str, default=None,
+                        help='JSON rename map e.g. \'{"observation.images.image":"observation.images.camera1"}\'')
     args = parser.parse_args()
 
     print(f"Loading SmolVLA from {args.policy_path} ...")
-    from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
-    from lerobot.policies.smolvla.processor_smolvla import SmolVLAProcessor
-    policy = SmolVLAPolicy.from_pretrained(args.policy_path).to(args.device)
-    policy.eval()
-    processor = SmolVLAProcessor.from_pretrained(args.policy_path)
+    runtime = load_smolvla_runtime(
+        policy_path=args.policy_path,
+        suite=args.suite,
+        device=args.device,
+        rename_map=parse_rename_map(args.rename_map),
+    )
+    if runtime.rename_map:
+        print(f"Using rename_map: {runtime.rename_map}")
 
-    extractor = SmolVLAFeatureExtractor(policy, processor, args.device)
+    extractor = SmolVLAFeatureExtractor(runtime)
 
     @torch.no_grad()
     def policy_fn_raw(obs, lang):
-        from PIL import Image
-        agentview = obs.get("agentview_image")
-        wrist = obs.get("robot0_eye_in_hand_image")
-        images = []
-        if agentview is not None:
-            images.append(Image.fromarray(agentview))
-        if wrist is not None:
-            images.append(Image.fromarray(wrist))
-        processed = processor(text=[lang], images=images, return_tensors="pt")
-        batch = {k: v.to(args.device) for k, v in processed.items()}
-        eef_pos = obs.get("robot0_eef_pos", np.zeros(3))
-        eef_quat = obs.get("robot0_eef_quat", np.zeros(4))
-        gripper = obs.get("robot0_gripper_qpos", np.zeros(2))
-        state = np.concatenate([eef_pos, eef_quat, gripper])
-        batch["observation.state"] = torch.tensor(state, dtype=torch.float32).unsqueeze(0).to(args.device)
-        policy.reset()
-        action = policy.select_action(batch)
-        return action.cpu().numpy().squeeze()
+        runtime.reset()
+        return runtime.select_action(obs, lang)
 
     bench = benchmark.get_benchmark_dict()
     suite = bench[args.suite]()
@@ -293,7 +270,7 @@ def main():
 
         for ep in range(args.n_episodes):
             feats, labels, np_ = collect_features_and_labels(
-                suite, task_id, ep, max_steps, extractor, policy_fn_raw
+                suite, task_id, ep, max_steps, extractor, policy_fn_raw, reset_fn=runtime.reset
             )
             if feats is None:
                 continue

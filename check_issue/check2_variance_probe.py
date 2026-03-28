@@ -41,6 +41,7 @@ from libero.libero.envs import OffScreenRenderEnv
 import os
 
 from lerobot.envs.libero import get_task_init_states, TASK_SUITE_MAX_STEPS
+from common_smolvla import load_smolvla_runtime, parse_rename_map
 
 
 # ── env helpers ──────────────────────────────────────────────────────────────
@@ -62,40 +63,20 @@ def build_raw_env(suite, task_id, init_state_id=0):
     return env, task.language
 
 
-def obs_to_tensor_batch(obs, lang, processor, device):
-    """Convert raw LIBERO obs dict to SmolVLA batch tensor."""
-    from PIL import Image
-    agentview = obs.get("agentview_image")
-    wrist = obs.get("robot0_eye_in_hand_image")
-    images = []
-    if agentview is not None:
-        images.append(Image.fromarray(agentview))
-    if wrist is not None:
-        images.append(Image.fromarray(wrist))
-
-    processed = processor(text=[lang], images=images, return_tensors="pt")
-    batch = {k: v.to(device) for k, v in processed.items()}
-
-    eef_pos = obs.get("robot0_eef_pos", np.zeros(3))
-    eef_quat = obs.get("robot0_eef_quat", np.zeros(4))
-    gripper = obs.get("robot0_gripper_qpos", np.zeros(2))
-    state = np.concatenate([eef_pos, eef_quat, gripper])
-    batch["observation.state"] = torch.tensor(state, dtype=torch.float32).unsqueeze(0).to(device)
-    return batch
-
-
 # ── variance computation ──────────────────────────────────────────────────────
 
-def compute_variance(policy, batch, M: int, short_prefix: int, device: str):
+def compute_variance(runtime, batch, M: int, short_prefix: int):
     """
     Sample M action chunks from policy at same observation.
     Returns scalar whitened variance V_t.
     """
     chunks = []
     for _ in range(M):
+        runtime.reset()
         with torch.no_grad():
             # Each call samples a new noise vector → different chunk
-            chunk = policy.predict_action_chunk(batch)  # (1, n_action_steps, action_dim)
+            chunk = runtime.policy.predict_action_chunk(batch)  # (1, n_action_steps, action_dim)
+            chunk = runtime.postprocessor(chunk)
         prefix = chunk[:, :short_prefix, :].cpu().numpy()  # (1, Hs, action_dim)
         chunks.append(prefix[0])  # (Hs, action_dim)
 
@@ -116,7 +97,7 @@ def compute_variance(policy, batch, M: int, short_prefix: int, device: str):
 # ── collect observations with labels ─────────────────────────────────────────
 
 def collect_labeled_obs(suite, task_id, init_state_id, max_steps,
-                        policy_fn_raw, success_horizon=10):
+                        policy_fn_raw, reset_fn=None, success_horizon=10):
     """
     Run one episode. For each step record obs and label:
       - "pre_success": within `success_horizon` steps before task completion
@@ -129,6 +110,9 @@ def collect_labeled_obs(suite, task_id, init_state_id, max_steps,
     obs = env._get_observations()
     success = False
     success_step = None
+
+    if reset_fn is not None:
+        reset_fn()
 
     for step in range(max_steps):
         obs_buffer.append(obs.copy())
@@ -170,23 +154,26 @@ def main():
                         help="Cap observations per label to avoid OOM")
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--out", type=str, default="check_issue/results/check2.json")
+    parser.add_argument("--rename_map", type=str, default=None,
+                        help='JSON rename map e.g. \'{"observation.images.image":"observation.images.camera1"}\'')
     args = parser.parse_args()
 
     # Load policy
     print(f"Loading SmolVLA from {args.policy_path} ...")
-    from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
-    from lerobot.policies.smolvla.processor_smolvla import SmolVLAProcessor
-    policy = SmolVLAPolicy.from_pretrained(args.policy_path).to(args.device)
-    policy.eval()
-    processor = SmolVLAProcessor.from_pretrained(args.policy_path)
+    runtime = load_smolvla_runtime(
+        policy_path=args.policy_path,
+        suite=args.suite,
+        device=args.device,
+        rename_map=parse_rename_map(args.rename_map),
+    )
+    if runtime.rename_map:
+        print(f"Using rename_map: {runtime.rename_map}")
 
     # Simple policy_fn_raw for collection
     @torch.no_grad()
     def policy_fn_raw(obs, lang):
-        batch = obs_to_tensor_batch(obs, lang, processor, args.device)
-        policy.reset()
-        action = policy.select_action(batch)
-        return action.cpu().numpy().squeeze()
+        runtime.reset()
+        return runtime.select_action(obs, lang)
 
     # Load suite
     bench = benchmark.get_benchmark_dict()
@@ -199,7 +186,7 @@ def main():
     for task_id in task_ids:
         for ep in range(args.n_episodes):
             labeled, success = collect_labeled_obs(
-                suite, task_id, ep, max_steps, policy_fn_raw
+                suite, task_id, ep, max_steps, policy_fn_raw, reset_fn=runtime.reset
             )
             all_labeled.extend(labeled)
             print(f"task {task_id} ep {ep}: {'SUCCESS' if success else 'fail'} | "
@@ -224,9 +211,10 @@ def main():
     for lbl, items in by_label.items():
         print(f"\nComputing variance for '{lbl}' ({len(items)} obs)...")
         for i, (obs, lang) in enumerate(items):
-            batch = obs_to_tensor_batch(obs, lang, processor, args.device)
-            policy.reset()
-            V = compute_variance(policy, batch, args.M, args.short_prefix, args.device)
+            batch = runtime.prepare_batch(obs, lang)
+            if batch is None:
+                continue
+            V = compute_variance(runtime, batch, args.M, args.short_prefix)
             variances[lbl].append(V)
             if (i + 1) % 10 == 0:
                 print(f"  {i+1}/{len(items)} done, current V={V:.4f}")

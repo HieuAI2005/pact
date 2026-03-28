@@ -41,6 +41,7 @@ from libero.libero import get_libero_path
 import os
 
 from lerobot.envs.libero import get_task_init_states, TASK_SUITE_MAX_STEPS
+from common_smolvla import load_smolvla_runtime, parse_rename_map
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────
@@ -132,13 +133,16 @@ def classify_failure(predicate_history: list[list[bool]]) -> str:
 
 # ── rollout with a random policy (placeholder until real policy is integrated) ─
 
-def rollout_episode(suite, task_id, init_state_id, max_steps, policy_fn):
+def rollout_episode(suite, task_id, init_state_id, max_steps, policy_fn, reset_fn=None):
     """
     Run one episode with policy_fn(obs) -> action.
     Returns (success, predicate_history, n_steps)
     """
     env, lang = build_env(suite, task_id, init_state_id)
     predicates = get_predicates(env)
+
+    if reset_fn is not None:
+        reset_fn()
 
     if not predicates:
         env.close()
@@ -170,65 +174,12 @@ def rollout_episode(suite, task_id, init_state_id, max_steps, policy_fn):
 
 # ── integrate with SmolVLA policy ─────────────────────────────────────────────
 
-def load_smolvla_policy(policy_path: str, device: str = "cuda"):
-    """Load SmolVLA policy from checkpoint."""
-    from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
-    policy = SmolVLAPolicy.from_pretrained(policy_path)
-    policy = policy.to(device)
-    policy.eval()
-    return policy
-
-
-def make_smolvla_policy_fn(policy, processor, device, rename_map=None):
-    """
-    Returns a closure that takes raw LIBERO obs dict + lang str
-    and returns a numpy action array.
-
-    rename_map: e.g. {"observation.images.image": "observation.images.camera1"}
-    """
-    rename_map = rename_map or {}
+def make_smolvla_policy_fn(runtime):
+    """Returns a closure that maps raw LIBERO observations to env actions."""
 
     @torch.no_grad()
     def policy_fn(obs, lang):
-        # Build batch expected by SmolVLA processor
-        import numpy as np
-        from PIL import Image
-
-        # Get images from LIBERO obs
-        agentview = obs.get("agentview_image")    # (H, W, 3) uint8
-        wrist = obs.get("robot0_eye_in_hand_image")
-
-        if agentview is None:
-            return np.zeros(7, dtype=np.float32)
-
-        images_dict = {}
-        if agentview is not None:
-            images_dict["observation.images.image"] = Image.fromarray(agentview)
-        if wrist is not None:
-            images_dict["observation.images.image2"] = Image.fromarray(wrist)
-
-        # Build robot state
-        eef_pos = obs.get("robot0_eef_pos", np.zeros(3))
-        eef_quat = obs.get("robot0_eef_quat", np.zeros(4))
-        gripper_qpos = obs.get("robot0_gripper_qpos", np.zeros(2))
-        state = np.concatenate([eef_pos, eef_quat, gripper_qpos])
-
-        # Process through SmolVLA processor
-        processed = processor(
-            text=[lang],
-            images=list(images_dict.values()),
-            return_tensors="pt",
-        )
-        batch = {k: v.to(device) for k, v in processed.items()}
-        batch["observation.state"] = torch.tensor(state, dtype=torch.float32).unsqueeze(0).to(device)
-
-        # Apply rename map
-        for old_k, new_k in rename_map.items():
-            if old_k in batch:
-                batch[new_k] = batch.pop(old_k)
-
-        action = policy.select_action(batch)
-        return action.cpu().numpy().squeeze()
+        return runtime.select_action(obs, lang)
 
     return policy_fn
 
@@ -259,7 +210,7 @@ def main():
     args = parser.parse_args()
 
     # Build rename map
-    rename_map = json.loads(args.rename_map) if args.rename_map else {}
+    rename_map = parse_rename_map(args.rename_map)
 
     # Load suite
     bench = benchmark.get_benchmark_dict()
@@ -271,14 +222,18 @@ def main():
     print(f"Suite: {args.suite} | Tasks: {task_ids} | Episodes/task: {args.n_episodes} | Max steps: {max_steps}")
 
     # Load policy
+    runtime = None
     if args.policy_path:
         print(f"Loading SmolVLA from {args.policy_path} ...")
-        from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy
-        from lerobot.policies.smolvla.processor_smolvla import SmolVLAProcessor
-        policy = SmolVLAPolicy.from_pretrained(args.policy_path).to(args.device)
-        policy.eval()
-        processor = SmolVLAProcessor.from_pretrained(args.policy_path)
-        policy_fn = make_smolvla_policy_fn(policy, processor, args.device, rename_map)
+        runtime = load_smolvla_runtime(
+            policy_path=args.policy_path,
+            suite=args.suite,
+            device=args.device,
+            rename_map=rename_map,
+        )
+        if runtime.rename_map:
+            print(f"Using rename_map: {runtime.rename_map}")
+        policy_fn = make_smolvla_policy_fn(runtime)
     else:
         print("WARNING: No policy_path provided, using random policy for testing")
         policy_fn = make_random_policy_fn()
@@ -293,7 +248,12 @@ def main():
 
         for ep in range(args.n_episodes):
             success, pred_hist, n_steps = rollout_episode(
-                suite, task_id, ep, max_steps, policy_fn
+                suite,
+                task_id,
+                ep,
+                max_steps,
+                policy_fn,
+                reset_fn=runtime.reset if runtime is not None else None,
             )
 
             if success is None:

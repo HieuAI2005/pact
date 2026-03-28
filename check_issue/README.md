@@ -11,15 +11,19 @@ Chạy theo thứ tự 1 → 3. Nếu Check 1 fail, paper cần rethink.
 chiếm bao nhiêu %? Nếu < 30% thì core assumption của PACT-V có vấn đề.
 
 ```bash
-cd /home/ubuntu/antd/arm_robot/pact
+cd /home/hiwe/project/pact
 source .venv/bin/activate
 
 python check_issue/check1_failure_classification.py \
     --policy_path outputs/train/2026-03-20/12-33-51_smolvla_libero_3090/checkpoints/300000/pretrained_model \
     --suite libero_spatial \
     --n_episodes 20 \
+    --rename_map='{"observation.images.image":"observation.images.camera1","observation.images.image2":"observation.images.camera2"}' \
     --out check_issue/results/check1_libero_spatial.json
 ```
+
+Nếu checkpoint của bạn đã dùng sẵn key `observation.images.image` / `observation.images.image2`
+thì có thể bỏ `--rename_map`.
 
 **Failure categories:**
 - `NEVER_GRASPED`: robot không bao giờ satisfy predicate đầu tiên → pure motor execution fail
@@ -46,6 +50,7 @@ python check_issue/check2_variance_probe.py \
     --n_episodes 20 \
     --M 10 \
     --short_prefix 5 \
+    --rename_map='{"observation.images.image":"observation.images.camera1","observation.images.image2":"observation.images.camera2"}' \
     --out check_issue/results/check2_libero_spatial.json
 ```
 
@@ -67,6 +72,7 @@ python check_issue/check3_linear_probe.py \
     --suite libero_spatial \
     --task_ids 0 1 2 \
     --n_episodes 15 \
+    --rename_map='{"observation.images.image":"observation.images.camera1","observation.images.image2":"observation.images.camera2"}' \
     --out check_issue/results/check3_libero_spatial.json
 ```
 
